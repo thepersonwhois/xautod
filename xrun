@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+SOCKET="/run/xautod/cmd.sock"
+
+if [ $# -eq 0 ]; then
+    echo "Usage: xrun <command> [args...]" >&2
+    exit 1
+fi
+
+if [ ! -S "$SOCKET" ]; then
+    echo "xautod is not running (socket $SOCKET not found)." >&2
+    exit 1
+fi
+
+# Detect current TTY (fallback to active VT from kernel)
+TTY=$(tty 2>/dev/null | sed 's|/dev/||')
+if [ -z "$TTY" ] || [ "$TTY" = "not a tty" ]; then
+    ACTIVE=$(cat /sys/class/tty/tty0/active 2>/dev/null || echo "tty1")
+    TTY="$ACTIVE"
+fi
+
+(
+    printf '%s\0' "$TTY"
+    for arg in "$@"; do
+        printf '%s\0' "$arg"
+    done
+) | nc -U "$SOCKET"
+
+echo "xrun: launched '$*' via xautod (tty: $TTY)"

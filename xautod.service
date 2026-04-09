@@ -1,0 +1,25 @@
+[Unit]
+Description=xautod — on-demand X session launcher
+Documentation=https://github.com/yourname/xautod
+After=local-fs.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/xautod
+Restart=on-failure
+RestartSec=2s
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=xautod
+
+# Needs access to /dev/tty* and /dev/input for Xorg
+SupplementaryGroups=tty input video
+
+# State dirs
+RuntimeDirectory=xautod
+RuntimeDirectoryMode=1777
+
+[Install]
+WantedBy=multi-user.target

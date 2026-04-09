@@ -1,0 +1,117 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+SOCKET_DIR="/run/xautod"
+SOCKET="$SOCKET_DIR/cmd.sock"
+LOGFILE="/var/log/xautod.log"
+LOCK_DIR="/run/xautod/locks"
+
+mkdir -p "$SOCKET_DIR" "$LOCK_DIR"
+chmod 1777 "$SOCKET_DIR"
+
+log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOGFILE"; }
+
+find_free_display() {
+    local d=1
+    while [ -e "/tmp/.X${d}-lock" ]; do
+        ((d++))
+    done
+    echo "$d"
+}
+
+find_vt_for_tty() {
+    local tty="$1"
+    if [[ "$tty" =~ ^tty([0-9]+)$ ]]; then
+        echo "${BASH_REMATCH[1]}"
+    else
+        # for pseudo-terminals, read the active VT from the kernel. i shouldn't have to implement this kind of failsafe but people do weird shit all the time. this is directed at you fnouhmenl and lala.
+        cat /sys/class/tty/tty0/active 2>/dev/null | grep -o '[0-9]*' || echo "1"
+    fi
+}
+
+handle_launch() {
+    # Protocol: PID:TTY:CMD (null-delimited args after CMD)
+    local pid="$1"
+    local tty="$2"
+    shift 2
+    local cmd=("$@")
+
+    local display_num
+    display_num=$(find_free_display)
+    local display=":${display_num}"
+    local vt
+    vt=$(find_vt_for_tty "$tty")
+    local lock="$LOCK_DIR/${pid}.lock"
+
+    log "Launching '${cmd[*]}' for PID $pid on display $display VT $vt (tty: $tty)"
+
+    # Start Xorg on the detected VT
+    Xorg "$display" "vt${vt}" \
+        -nolisten tcp \
+        -auth "/tmp/xautod-${display_num}.xauth" \
+        &>/tmp/xautod-xorg-${display_num}.log &
+    local xpid=$!
+    touch "$lock"
+
+    # Wait for X to be ready (max 5s)
+    local tries=0
+    until DISPLAY="$display" xdpyinfo &>/dev/null; do
+        sleep 0.2
+        ((tries++))
+        if (( tries > 25 )); then
+            log "ERROR: X server $display never became ready. Killing."
+            kill "$xpid" 2>/dev/null || true
+            rm -f "$lock"
+            return 1
+        fi
+    done
+    log "X server $display ready."
+
+    # Launch the app with DISPLAY set
+    DISPLAY="$display" "${cmd[@]}" &
+    local apppid=$!
+
+    # Wait for the app to exit
+    wait "$apppid" || true
+    log "App '${cmd[*]}' (PID $apppid) exited."
+
+    # Tear down Xorg
+    kill "$xpid" 2>/dev/null || true
+    wait "$xpid" 2>/dev/null || true
+    rm -f "$lock" "/tmp/xautod-${display_num}.xauth"
+    log "X server $display torn down."
+}
+
+cleanup() {
+    log "xautod shutting down."
+    rm -f "$SOCKET"
+    # Kill any lingering X servers we started
+    for lock in "$LOCK_DIR"/*.lock; do
+        [ -e "$lock" ] || continue
+        local pid
+        pid=$(basename "$lock" .lock)
+        kill "$pid" 2>/dev/null || true
+    done
+}
+trap cleanup EXIT SIGTERM SIGINT
+
+# Remove stale socket
+rm -f "$SOCKET"
+log "xautod started. Listening on $SOCKET"
+
+# Listen for launch requests via unix socket
+# Client sends: TTY\0ARG0\0ARG1\0...\0
+while true; do
+    nc -lU "$SOCKET" | (
+        # Read null-delimited tokens
+        IFS= read -r -d '' tty 2>/dev/null || true
+        args=()
+        while IFS= read -r -d '' arg 2>/dev/null; do
+            args+=("$arg")
+        done
+        if [ ${#args[@]} -gt 0 ]; then
+            handle_launch $$ "$tty" "${args[@]}" &
+        fi
+    )
+done
